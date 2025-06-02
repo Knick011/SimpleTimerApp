@@ -1,326 +1,377 @@
-// src/services/TimerService.js - Core timer with background tracking
+// Enhanced TimerService.js - Phone lock detection and background timer
 import { AppState, Platform, NativeEventEmitter, NativeModules } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const TIMER_STORAGE_KEY = '@timer_remaining';
 const TIMER_START_KEY = '@timer_start_time';
+const LOCK_STATE_KEY = '@lock_state';
 
 class TimerService {
   constructor() {
     // Core timer state
-    this.remainingTime = 0;
+    this.availableTime = 0;
     this.timer = null;
     this.listeners = new Set();
     this.appState = AppState.currentState || 'active';
-    this.isTimerActive = false;
     this.isDeviceLocked = false;
+    this.isTimerRunning = false;
     
-    // Background tracking state
+    // Background tracking
     this.backgroundStartTime = null;
-    this.lastUpdateTime = null;
+    this.lockStartTime = null;
     
     // Initialize
-    this.loadSavedTime();
+    this.initialize();
+  }
+
+  async initialize() {
+    console.log('🚀 Initializing TimerService');
+    
+    // Load saved data
+    await this.loadSavedTime();
+    
+    // Setup device lock listener
     this.setupDeviceLockListener();
     
-    console.log('Timer Service initialized');
+    // Setup app state listener
+    this.setupAppStateListener();
+    
+    // Get initial lock state
+    this.getCurrentLockState();
+    
+    console.log('✅ TimerService initialized');
   }
 
   setupDeviceLockListener() {
-    if (Platform.OS === 'android') {
+    if (Platform.OS === 'android' && NativeModules.DeviceLockModule) {
       const eventEmitter = new NativeEventEmitter(NativeModules.DeviceLockModule);
-      eventEmitter.addListener('deviceLocked', () => {
+      
+      eventEmitter.addListener('deviceLocked', (data) => {
+        console.log('📱 Device locked', data);
         this.isDeviceLocked = true;
-        this.handleDeviceLockChange();
+        this.handleLockStateChange();
+        this.notifyListeners({
+          event: 'deviceLocked',
+          availableTime: this.availableTime,
+          isLocked: true,
+          timestamp: data.timestamp
+        });
       });
-      eventEmitter.addListener('deviceUnlocked', () => {
+      
+      eventEmitter.addListener('deviceUnlocked', (data) => {
+        console.log('🔓 Device unlocked', data);
         this.isDeviceLocked = false;
-        this.handleDeviceLockChange();
+        this.handleLockStateChange();
+        this.notifyListeners({
+          event: 'deviceUnlocked',
+          availableTime: this.availableTime,
+          isLocked: false,
+          timestamp: data.timestamp
+        });
+      });
+      
+      eventEmitter.addListener('currentLockState', (data) => {
+        console.log('📋 Current lock state', data);
+        this.isDeviceLocked = data.isLocked;
+        this.handleLockStateChange();
       });
     }
   }
 
-  handleDeviceLockChange() {
-    if (this.isDeviceLocked) {
-      this.stopTimer();
-      this.saveTime();
-    } else if (!this.isDeviceLocked && this.appState === 'background') {
-      this.startTimer();
-    }
+  setupAppStateListener() {
+    AppState.addEventListener('change', (nextAppState) => {
+      console.log(`📱 App state: ${this.appState} -> ${nextAppState}`);
+      
+      const previousState = this.appState;
+      this.appState = nextAppState;
+      
+      this.handleAppStateChange(previousState, nextAppState);
+      
+      this.notifyListeners({
+        event: 'appStateChanged',
+        previousState,
+        currentState: nextAppState,
+        availableTime: this.availableTime
+      });
+    });
   }
-  
-  // Handle app state changes
-  handleAppStateChange(nextAppState) {
-    console.log('App state changed:', nextAppState);
-    this.appState = nextAppState;
 
-    if (nextAppState === 'active') {
-      // App is in foreground
-      this.stopTimer();
-      this.loadSavedTime();
-    } else if (nextAppState === 'background' || nextAppState === 'inactive') {
-      // App is in background
-      if (!this.isDeviceLocked) {
-        this.startTimer();
-      }
-      this.saveTime();
+  getCurrentLockState() {
+    if (Platform.OS === 'android' && NativeModules.DeviceLockModule) {
+      NativeModules.DeviceLockModule.getCurrentLockState();
     }
   }
 
-  // Only run timer if app is backgrounded/inactive and device is unlocked
+  handleLockStateChange() {
+    this.updateTimerState();
+    this.saveState();
+  }
+
+  handleAppStateChange(previousState, currentState) {
+    if (currentState === 'active') {
+      // App came to foreground - stop timer
+      this.stopTimer();
+      this.processBackgroundTime();
+    } else if (previousState === 'active') {
+      // App went to background - start timer if device is unlocked
+      this.updateTimerState();
+    }
+  }
+
   updateTimerState() {
-    const shouldRun = (this.appState === 'background' || this.appState === 'inactive') && !this.isDeviceLocked;
+    const shouldRunTimer = this.shouldTimerRun();
     
-    if (shouldRun && !this.isTimerActive) {
+    if (shouldRunTimer && !this.isTimerRunning) {
       this.startTimer();
-    } else if (!shouldRun && this.isTimerActive) {
+    } else if (!shouldRunTimer && this.isTimerRunning) {
       this.stopTimer();
-      this.isTimerActive = false;
     }
   }
-  
-  // Load saved time when app starts
+
+  shouldTimerRun() {
+    // Timer should run when:
+    // 1. Device is unlocked AND
+    // 2. App is in background/inactive AND
+    // 3. We have available time
+    return !this.isDeviceLocked && 
+           (this.appState === 'background' || this.appState === 'inactive') && 
+           this.availableTime > 0;
+  }
+
+  startTimer() {
+    if (this.isTimerRunning) return;
+    
+    console.log('▶️ Starting timer');
+    this.isTimerRunning = true;
+    this.backgroundStartTime = Date.now();
+    
+    this.timer = setInterval(() => {
+      this.tick();
+    }, 1000);
+    
+    this.notifyListeners({
+      event: 'trackingStarted',
+      availableTime: this.availableTime,
+      timestamp: Date.now()
+    });
+  }
+
+  stopTimer() {
+    if (!this.isTimerRunning) return;
+    
+    console.log('⏸️ Stopping timer');
+    
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    
+    this.isTimerRunning = false;
+    
+    this.notifyListeners({
+      event: 'trackingStopped',
+      availableTime: this.availableTime,
+      timestamp: Date.now()
+    });
+  }
+
+  tick() {
+    if (this.availableTime <= 0) {
+      this.handleTimeExpired();
+      return;
+    }
+    
+    this.availableTime--;
+    this.saveTime();
+    
+    this.notifyListeners({
+      event: 'timeUpdate',
+      availableTime: this.availableTime,
+      timestamp: Date.now()
+    });
+    
+    if (this.availableTime <= 0) {
+      this.handleTimeExpired();
+    }
+  }
+
+  handleTimeExpired() {
+    console.log('⌛ Time expired!');
+    this.stopTimer();
+    
+    this.notifyListeners({
+      event: 'timeExpired',
+      availableTime: 0,
+      timestamp: Date.now()
+    });
+  }
+
+  processBackgroundTime() {
+    // Calculate time spent in background and deduct it
+    if (this.backgroundStartTime) {
+      const backgroundDuration = Math.floor((Date.now() - this.backgroundStartTime) / 1000);
+      console.log(`📊 Background duration: ${backgroundDuration}s`);
+      
+      if (backgroundDuration > 0) {
+        this.availableTime = Math.max(0, this.availableTime - backgroundDuration);
+        this.saveTime();
+        
+        this.notifyListeners({
+          event: 'backgroundTimeProcessed',
+          backgroundDuration,
+          availableTime: this.availableTime,
+          timestamp: Date.now()
+        });
+      }
+    }
+    
+    this.backgroundStartTime = null;
+  }
+
+  // Public methods
   async loadSavedTime() {
     try {
       const savedTime = await AsyncStorage.getItem(TIMER_STORAGE_KEY);
-      const startTime = await AsyncStorage.getItem(TIMER_START_KEY);
-      
-      if (savedTime && startTime) {
-        const elapsed = Math.floor((Date.now() - parseInt(startTime)) / 1000);
-        this.remainingTime = Math.max(0, parseInt(savedTime) - elapsed);
-        this.notifyListeners();
+      if (savedTime) {
+        this.availableTime = parseInt(savedTime, 10);
+        console.log(`💾 Loaded ${this.availableTime}s from storage`);
+        
+        this.notifyListeners({
+          event: 'timeLoaded',
+          availableTime: this.availableTime,
+          timestamp: Date.now()
+        });
       }
     } catch (error) {
       console.error('Error loading saved time:', error);
     }
   }
-  
-  // Add time to the timer
-  addTime(seconds) {
-    this.remainingTime += seconds;
-    this.notifyListeners();
-    this.saveTime();
-  }
-  
-  // Start the timer
-  startTimer() {
-    if (this.timer) return;
-    
-    this.timer = setInterval(() => {
-      if (this.remainingTime > 0) {
-        this.remainingTime--;
-        this.notifyListeners();
-        this.saveTime();
-      } else {
-        this.stopTimer();
-      }
-    }, 1000);
-    
-    this.isTimerActive = true;
-  }
-  
-  // Stop the timer
-  stopTimer() {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-      this.isTimerActive = false;
-    }
-  }
-  
-  // Save current time to storage
+
   async saveTime() {
     try {
-      await AsyncStorage.setItem(TIMER_STORAGE_KEY, this.remainingTime.toString());
-      await AsyncStorage.setItem(TIMER_START_KEY, Date.now().toString());
+      await AsyncStorage.setItem(TIMER_STORAGE_KEY, this.availableTime.toString());
     } catch (error) {
       console.error('Error saving time:', error);
     }
   }
 
-  // Add listener for timer updates
-  addListener(callback) {
-    this.listeners.add(callback);
-    return () => this.listeners.delete(callback);
-  }
-  
-  // Notify all listeners of timer updates
-  notifyListeners() {
-    this.listeners.forEach((callback) => callback(this.remainingTime));
-  }
-  
-  // Format time as MM:SS
-  formatTime(seconds) {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  }
-  
-  // Start tracking time when app goes to background
-  _startBackgroundTracking() {
-    if (this.remainingTime > 0 && !this.timer) {
-      console.log(`🟢 Starting background tracking with ${this.remainingTime}s available`);
-      
-      this.backgroundStartTime = Date.now();
-      this.lastUpdateTime = Date.now();
-      
-      // Update every second
-      this.timer = setInterval(() => {
-        this._updateBackgroundTime();
-      }, 1000);
-      
-      this.notifyListeners();
-    } else if (this.remainingTime <= 0) {
-      console.log('⚠️  No time available - not starting tracking');
-    } else {
-      console.log('⚠️  Already tracking');
-    }
-  }
-  
-  // Stop tracking when app comes to foreground
-  _stopBackgroundTracking() {
-    if (this.timer) {
-      console.log('🔴 Stopping background tracking');
-      
-      this.timer = null;
-      
-      // Final update
-      this._updateBackgroundTime();
-      
-      const totalBackgroundTime = this.backgroundStartTime ? 
-        Math.floor((Date.now() - this.backgroundStartTime) / 1000) : 0;
-      
-      this.remainingTime = Math.max(0, this.remainingTime - totalBackgroundTime);
-      
-      this.notifyListeners();
-      
-      // Save updated time
-      this.saveTime();
-    }
-  }
-  
-  // Update time during background tracking
-  _updateBackgroundTime() {
-    if (!this.timer || !this.lastUpdateTime) return;
-    
-    const now = Date.now();
-    const elapsedSeconds = Math.floor((now - this.lastUpdateTime) / 1000);
-    
-    if (elapsedSeconds > 0) {
-      const previousTime = this.remainingTime;
-      this.remainingTime = Math.max(0, this.remainingTime - elapsedSeconds);
-      
-      console.log(`⏱️  Time update: -${elapsedSeconds}s, remaining: ${this.remainingTime}s`);
-      
-      this.lastUpdateTime = now;
-      
-      this.notifyListeners();
-      
-      // Check if time expired
-      if (this.remainingTime <= 0 && previousTime > 0) {
-        console.log('⌛ Time expired!');
-        this._handleTimeExpired();
-      }
-    }
-  }
-  
-  // Handle time expiration
-  _handleTimeExpired() {
-    this._stopBackgroundTracking();
-    this.notifyListeners();
-  }
-  
-  // Save time data to storage
-  async saveTimeData() {
+  async saveState() {
     try {
-      const data = {
-        remainingTime: this.remainingTime,
-        lastUpdated: new Date().toISOString(),
-        appState: this.appState
+      const state = {
+        isDeviceLocked: this.isDeviceLocked,
+        appState: this.appState,
+        isTimerRunning: this.isTimerRunning,
+        timestamp: Date.now()
       };
-      
-      await AsyncStorage.setItem(TIMER_STORAGE_KEY, data.remainingTime.toString());
-      await AsyncStorage.setItem(TIMER_START_KEY, data.lastUpdated);
-      
-      console.log(`💾 Saved ${this.remainingTime}s to storage`);
-      
+      await AsyncStorage.setItem(LOCK_STATE_KEY, JSON.stringify(state));
     } catch (error) {
-      console.error('Error saving time data:', error);
+      console.error('Error saving state:', error);
     }
   }
-  
-  // Add time credits (like earning time through quizzes)
+
   addTimeCredits(seconds) {
-    const previousTime = this.remainingTime;
-    this.remainingTime += seconds;
+    const previousTime = this.availableTime;
+    this.availableTime += seconds;
     
-    console.log(`💰 Added ${seconds}s credits. Total: ${this.remainingTime}s`);
+    console.log(`💰 Added ${seconds}s. Total: ${this.availableTime}s`);
     
     this.saveTime();
-    this.notifyListeners();
+    this.updateTimerState(); // Check if timer should start
     
-    return this.remainingTime;
+    this.notifyListeners({
+      event: 'creditsAdded',
+      amount: seconds,
+      previousTotal: previousTime,
+      newTotal: this.availableTime,
+      timestamp: Date.now()
+    });
+    
+    return this.availableTime;
   }
-  
-  // Remove time credits (for testing or penalties)
+
   removeTimeCredits(seconds) {
-    const previousTime = this.remainingTime;
-    this.remainingTime = Math.max(0, this.remainingTime - seconds);
+    const previousTime = this.availableTime;
+    this.availableTime = Math.max(0, this.availableTime - seconds);
     
-    console.log(`💸 Removed ${seconds}s credits. Total: ${this.remainingTime}s`);
+    console.log(`💸 Removed ${seconds}s. Total: ${this.availableTime}s`);
     
     this.saveTime();
-    this.notifyListeners();
+    this.updateTimerState(); // Check if timer should stop
     
-    return this.remainingTime;
+    this.notifyListeners({
+      event: 'creditsRemoved',
+      amount: seconds,
+      previousTotal: previousTime,
+      newTotal: this.availableTime,
+      timestamp: Date.now()
+    });
+    
+    return this.availableTime;
   }
-  
-  // Get current available time
-  getAvailableTime() {
-    return this.remainingTime;
-  }
-  
-  // Get detailed status for debugging
-  getStatus() {
-    return {
-      remainingTime: this.remainingTime,
-      formattedTime: this.formatTime(this.remainingTime),
-      appState: this.appState,
-      backgroundStartTime: this.backgroundStartTime,
-      hasTimer: !!this.timer
-    };
-  }
-  
-  // Force start tracking (for testing)
-  forceStartTracking() {
-    console.log('🧪 Force starting tracking');
-    this._startBackgroundTracking();
-  }
-  
-  // Force stop tracking (for testing)
-  forceStopTracking() {
-    console.log('🧪 Force stopping tracking');
-    this._stopBackgroundTracking();
-  }
-  
-  // Reset all time and state (for testing)
+
   async resetAll() {
     console.log('🔄 Resetting all timer data');
     
-    this._stopBackgroundTracking();
-    this.remainingTime = 0;
+    this.stopTimer();
+    this.availableTime = 0;
     
-    await AsyncStorage.removeItem(TIMER_STORAGE_KEY);
-    await AsyncStorage.removeItem(TIMER_START_KEY);
+    try {
+      await AsyncStorage.multiRemove([TIMER_STORAGE_KEY, TIMER_START_KEY, LOCK_STATE_KEY]);
+    } catch (error) {
+      console.error('Error resetting storage:', error);
+    }
     
-    this.notifyListeners();
+    this.notifyListeners({
+      event: 'reset',
+      availableTime: 0,
+      timestamp: Date.now()
+    });
   }
-  
-  // Cleanup
+
+  // Event system
+  addEventListener(callback) {
+    this.listeners.add(callback);
+    return () => this.listeners.delete(callback);
+  }
+
+  notifyListeners(event) {
+    this.listeners.forEach(callback => {
+      try {
+        callback(event);
+      } catch (error) {
+        console.error('Error in listener:', error);
+      }
+    });
+  }
+
+  // Utility methods
+  formatTime(seconds) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    
+    if (hours > 0) {
+      return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+    return `${minutes}:${secs.toString().padStart(2, '0')}`;
+  }
+
+  getStatus() {
+    return {
+      availableTime: this.availableTime,
+      formattedTime: this.formatTime(this.availableTime),
+      isTimerRunning: this.isTimerRunning,
+      isDeviceLocked: this.isDeviceLocked,
+      appState: this.appState,
+      shouldRun: this.shouldTimerRun()
+    };
+  }
+
   cleanup() {
-    console.log('🧹 Cleaning up timer service');
+    console.log('🧹 Cleaning up TimerService');
     this.stopTimer();
     this.saveTime();
+    this.saveState();
   }
 }
 
