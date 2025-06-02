@@ -1,7 +1,6 @@
 // src/services/TimerService.js - Core timer with background tracking
-import { AppState, Platform } from 'react-native';
+import { AppState, Platform, NativeEventEmitter, NativeModules } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import DeviceInfo from 'react-native-device-info';
 
 const TIMER_STORAGE_KEY = '@timer_remaining';
 const TIMER_START_KEY = '@timer_start_time';
@@ -13,8 +12,8 @@ class TimerService {
     this.timer = null;
     this.listeners = new Set();
     this.appState = AppState.currentState || 'active';
-    this.isDeviceLocked = false;
     this.isTimerActive = false;
+    this.isDeviceLocked = false;
     
     // Background tracking state
     this.backgroundStartTime = null;
@@ -22,33 +21,58 @@ class TimerService {
     
     // Initialize
     this.loadSavedTime();
-    
-    // Listen for device lock state changes (Android only)
-    if (Platform.OS === 'android') {
-      DeviceInfo.isScreenLocked().then((locked) => {
-        this.isDeviceLocked = locked;
-      });
-      // Poll for lock state every second (since no event is available)
-      setInterval(async () => {
-        const locked = await DeviceInfo.isScreenLocked();
-        if (locked !== this.isDeviceLocked) {
-          this.isDeviceLocked = locked;
-          this.updateTimerState();
-        }
-      }, 1000);
-    }
+    this.setupDeviceLockListener();
     
     console.log('Timer Service initialized');
   }
+
+  setupDeviceLockListener() {
+    if (Platform.OS === 'android') {
+      const eventEmitter = new NativeEventEmitter(NativeModules.DeviceLockModule);
+      eventEmitter.addListener('deviceLocked', () => {
+        this.isDeviceLocked = true;
+        this.handleDeviceLockChange();
+      });
+      eventEmitter.addListener('deviceUnlocked', () => {
+        this.isDeviceLocked = false;
+        this.handleDeviceLockChange();
+      });
+    }
+  }
+
+  handleDeviceLockChange() {
+    if (this.isDeviceLocked) {
+      this.stopTimer();
+      this.saveTime();
+    } else if (!this.isDeviceLocked && this.appState === 'background') {
+      this.startTimer();
+    }
+  }
   
-  // Only run timer if app is backgrounded/closed and device is unlocked
+  // Handle app state changes
+  handleAppStateChange(nextAppState) {
+    console.log('App state changed:', nextAppState);
+    this.appState = nextAppState;
+
+    if (nextAppState === 'active') {
+      // App is in foreground
+      this.stopTimer();
+      this.loadSavedTime();
+    } else if (nextAppState === 'background' || nextAppState === 'inactive') {
+      // App is in background
+      if (!this.isDeviceLocked) {
+        this.startTimer();
+      }
+      this.saveTime();
+    }
+  }
+
+  // Only run timer if app is backgrounded/inactive and device is unlocked
   updateTimerState() {
-    const shouldRun =
-      (this.appState === 'background' || this.appState === 'inactive') &&
-      !this.isDeviceLocked;
+    const shouldRun = (this.appState === 'background' || this.appState === 'inactive') && !this.isDeviceLocked;
+    
     if (shouldRun && !this.isTimerActive) {
       this.startTimer();
-      this.isTimerActive = true;
     } else if (!shouldRun && this.isTimerActive) {
       this.stopTimer();
       this.isTimerActive = false;
@@ -91,6 +115,8 @@ class TimerService {
         this.stopTimer();
       }
     }, 1000);
+    
+    this.isTimerActive = true;
   }
   
   // Stop the timer
@@ -98,6 +124,7 @@ class TimerService {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+      this.isTimerActive = false;
     }
   }
   
@@ -110,8 +137,8 @@ class TimerService {
       console.error('Error saving time:', error);
     }
   }
-  
-  // Add a listener for timer updates
+
+  // Add listener for timer updates
   addListener(callback) {
     this.listeners.add(callback);
     return () => this.listeners.delete(callback);
@@ -119,7 +146,7 @@ class TimerService {
   
   // Notify all listeners of timer updates
   notifyListeners() {
-    this.listeners.forEach(callback => callback(this.remainingTime));
+    this.listeners.forEach((callback) => callback(this.remainingTime));
   }
   
   // Format time as MM:SS
@@ -127,19 +154,6 @@ class TimerService {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  }
-  
-  // Handle app state changes
-  handleAppStateChange(nextAppState) {
-    if (
-      typeof this.appState === 'string' &&
-      this.appState.match(/inactive|background/) &&
-      nextAppState === 'active'
-    ) {
-      this.loadSavedTime();
-    }
-    this.appState = nextAppState;
-    this.updateTimerState();
   }
   
   // Start tracking time when app goes to background
@@ -305,10 +319,8 @@ class TimerService {
   // Cleanup
   cleanup() {
     console.log('🧹 Cleaning up timer service');
-    
-    if (this.timer) {
-      this._stopBackgroundTracking();
-    }
+    this.stopTimer();
+    this.saveTime();
   }
 }
 
